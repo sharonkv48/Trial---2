@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import pandas as pd
+import numpy as np
 from dotenv import load_dotenv
 from dateutil import parser
 from openai import AzureOpenAI
@@ -33,16 +34,19 @@ PM_PRIORITY_1 = ["RF Raw ID", "RF Raw Entity Name"]
 PM_PRIORITY_2 = ["QIU Name", "EntityName"]
 
 # =========================================================
-# FEW-SHOT SYSTEM PROMPT
+# SYSTEM PROMPT (BATCH MAPPING)
 # =========================================================
 
-SYSTEM_PROMPT = """You are a financial data mapper. Return STRICT JSON with 'mapped_to' and 'confidence'.
-Categories: [account, account description, beginning balance, ending balance]
+SYSTEM_PROMPT = """You are a financial data mapper. Return STRICT JSON.
+Task: Map a list of raw headers to: [account, account description, beginning balance, ending balance]
 
 RULES:
 1. 'ending balance' and 'closing balance' are synonymous.
 2. 'beginning balance' and 'forwarding balance' are synonymous.
-3. Return JSON ONLY: {"mapped_to": "category", "confidence": 0.0-1.0}"""
+3. Use 'account' for numeric codes (e.g., 1116, 1010-6172).
+4. Use 'account description' for text labels (e.g., Checking Operating).
+5. Return a JSON object where keys are raw headers and values are the categories or "other".
+Example: {"Raw Header 1": "account", "Raw Header 2": "other"}"""
 
 # =========================================================
 # HELPERS & LOGGING
@@ -58,15 +62,22 @@ def setup_logging(input_folder):
     return logging.getLogger("ingestion")
 
 def normalize_strict(text):
-    """Normalizes text by lowercase, stripping, and removing all non-alphanumeric characters."""
-    if not text or text == "nan": return ""
-    # Remove all special characters/punctuation, keep only letters and numbers
-    clean = re.sub(r'[^a-zA-Z0-9]', '', str(text))
-    return clean.lower()
+    if pd.isna(text) or str(text).lower() == "nan": return ""
+    return re.sub(r'[^a-zA-Z0-9]', '', str(text)).lower()
 
 def validate_excel_file(path):
     ext = os.path.splitext(path)[1].lower()
     return "openpyxl" if ext == ".xlsx" else "xlrd"
+
+def extract_date_flexible(text):
+    try:
+        match = re.search(r"(\d{2})[/_-](\d{2,4})", text)
+        if match:
+            m, y = match.groups()
+            y = f"20{y}" if len(y) == 2 else y
+            return parser.parse(f"{y}-{m}-01")
+        return parser.parse(text, fuzzy=True)
+    except: return None
 
 def extract_date_from_filename(filename):
     patterns = [r"(\d{4})(\d{2})", r"(\d{2})_(\d{2})_(\d{2})", r"(\d{2})_(\d{2})"]
@@ -82,50 +93,24 @@ def extract_date_from_filename(filename):
     return None
 
 def make_unique_headers(headers):
-    seen = {}
-    unique_headers = []
+    seen, unique = {}, []
     for h in headers:
-        clean_h = str(h).strip().lower()
-        if clean_h not in seen:
-            seen[clean_h] = 0
-            unique_headers.append(clean_h)
+        c = str(h).strip().lower()
+        if c not in seen:
+            seen[c] = 0
+            unique.append(c)
         else:
-            seen[clean_h] += 1
-            unique_headers.append(f"{clean_h}_{seen[clean_h]}")
-    return unique_headers
+            seen[c] += 1
+            unique.append(f"{c}_{seen[c]}")
+    return unique
 
 # =========================================================
-# PROPERTY LOOKUP (CLEANED ALPHANUMERIC MATCH)
+# BATCH AI MAPPING (One call per sheet)
 # =========================================================
 
-def match_property_tiered(df, master_df):
-    """Tiered lookup using strict alphanumeric normalization for both sheet and master data."""
-    # Flatten top 20 rows and clean every cell
-    top_rows = df.head(20).astype(str).values.flatten()
-    clean_sheet_text = [normalize_strict(cell) for cell in top_rows if normalize_strict(cell) != ""]
-    
-    priority_groups = [PM_PRIORITY_1, PM_PRIORITY_2]
-    
-    for group in priority_groups:
-        for _, row in master_df.iterrows():
-            prop_id = row.get(PM_ENTITY_ID, None)
-            prop_display_name = row.get(PM_ENTITY_NAME, "Unknown") 
-            
-            for col_name in group:
-                keyword = normalize_strict(row.get(col_name, ""))
-                if not keyword: continue
-                
-                # Check if the cleaned keyword exists as a full match in any cleaned cell
-                if any(keyword == cell for cell in clean_sheet_text):
-                    return prop_display_name, prop_id
-    return None, None
-
-# =========================================================
-# AI MAPPING
-# =========================================================
-
-def ask_llm(client, deployment, col_name, sample, report_year):
-    user_msg = f"Report Year: {report_year}\nHeader: {col_name}\nSamples: {sample}"
+def ask_llm_batch(client, deployment, headers_with_samples, report_year):
+    """Sends all headers in one prompt to minimize API calls."""
+    user_msg = f"Report Year: {report_year}\nHeaders and Samples:\n{json.dumps(headers_with_samples)}"
     try:
         r = client.chat.completions.create(
             model=deployment,
@@ -133,101 +118,111 @@ def ask_llm(client, deployment, col_name, sample, report_year):
             temperature=0, response_format={"type": "json_object"}
         )
         return json.loads(r.choices[0].message.content)
-    except: return {"mapped_to": "other", "confidence": 0}
+    except Exception as e:
+        return {}
+
+# =========================================================
+# PROPERTY LOOKUP
+# =========================================================
+
+def match_property_tiered(df, master_df):
+    top_rows = df.head(20).astype(str).values.flatten()
+    clean_sheet = [normalize_strict(cell) for cell in top_rows if normalize_strict(cell) != ""]
+    for group in [PM_PRIORITY_1, PM_PRIORITY_2]:
+        for _, row in master_df.iterrows():
+            tid, tname = row.get(PM_ENTITY_ID, ""), row.get(PM_ENTITY_NAME, "")
+            for col in group:
+                kw = normalize_strict(row.get(col, ""))
+                if kw and any(kw == c for c in clean_sheet):
+                    return str(tname), str(tid)
+    return "", ""
 
 # =========================================================
 # CORE PROCESSING
 # =========================================================
 
 def process_sheet(df, file_name, sheet_name, master_df, client, deployment, logger):
-    # Ignore Keyword Check
-    top_text = " ".join(df.head(10).astype(str).values.flatten()).lower()
-    if any(k in top_text for k in IGNORE_KEYWORDS): return None
+    if any(k in " ".join(df.head(10).astype(str).values.flatten()).lower() for k in IGNORE_KEYWORDS): return None
 
     # Date Detection
-    report_date = extract_date_from_filename(file_name)
+    report_date = None
+    for i in range(min(20, len(df))):
+        line = " ".join(df.iloc[i].astype(str))
+        if any(c.isdigit() for c in line):
+            report_date = extract_date_flexible(line)
+            if report_date: break
+    if not report_date: report_date = extract_date_from_filename(file_name)
     report_year = report_date.year if report_date else "Unknown"
 
     # Header Detection
-    header_start = None
+    h_start = None
     for i, row in df.iterrows():
-        text = " ".join(row.astype(str)).lower()
-        if sum(k in text for k in REQUIRED_HEADER_KEYWORDS) >= 2:
-            header_start = i
-            break
-    if header_start is None: return None
+        if sum(k in " ".join(row.astype(str)).lower() for k in REQUIRED_HEADER_KEYWORDS) >= 2:
+            h_start = i; break
+    if h_start is None: return None
 
-    # Merge Multi-Row Headers
-    header_rows = [header_start]
-    for i in range(header_start + 1, min(header_start + MAX_HEADER_ROWS, len(df))):
-        if pd.to_numeric(df.iloc[i], errors="coerce").notna().mean() < 0.3:
-            header_rows.append(i)
+    # Merge Headers
+    h_rows = [h_start]
+    for i in range(h_start + 1, min(h_start + MAX_HEADER_ROWS, len(df))):
+        if pd.to_numeric(df.iloc[i], errors="coerce").notna().mean() < 0.3: h_rows.append(i)
         else: break
     
-    raw_headers = []
+    raw_h = []
     for c in range(df.shape[1]):
-        parts = [str(df.iloc[r, c]).strip().lower() for r in header_rows if str(df.iloc[r, c]).strip().lower() not in ["nan", ""]]
-        raw_headers.append(" ".join(parts) if parts else f"empty_gap_{c}")
+        parts = [str(df.iloc[r, c]).strip().lower() for r in h_rows if str(df.iloc[r, c]).strip().lower() not in ["nan", ""]]
+        raw_h.append(" ".join(parts) if parts else f"empty_gap_{c}")
     
-    headers = make_unique_headers(raw_headers)
-
-    data_block = df.iloc[max(header_rows) + 1:].copy()
+    headers = make_unique_headers(raw_h)
+    data_block = df.iloc[max(h_rows) + 1:].copy()
     data_block.columns = headers
     
-    rows_list = []
+    valid_rows = []
     for _, row in data_block.iterrows():
         if any(TOTAL_REGEX.match(str(s)) for s in row): break
-        rows_list.append(row)
-    if not rows_list: return None
-    final_data = pd.DataFrame(rows_list)
+        valid_rows.append(row)
+    if not valid_rows: return None
+    final_data = pd.DataFrame(valid_rows)
 
-    prop_name, prop_code = match_property_tiered(df, master_df)
+    # 1. Exact Metadata Mapping
     clean = pd.DataFrame(index=final_data.index)
-    
-    # EXACT KEYWORD MATCHES
-    exact_targets = ["reporting book", "account tree", "location", "database", "report id", "period starting", "debit", "credit"]
-    for target in exact_targets:
-        col = next((c for c in final_data.columns if c == target), None)
-        if col: clean[target] = final_data[col]
+    exact = ["reporting book", "account tree", "location", "database", "report id", "period starting", "debit", "credit"]
+    for t in exact:
+        col = next((c for c in final_data.columns if c == t), None)
+        if col: clean[t] = final_data[col]
 
-    # Map Closing Balance to Ending Balance
+    # 2. Activity & Balance Keyword Mapping
     bal_col = next((c for c in final_data.columns if "ending balance" in c or "closing balance" in c), None)
     if bal_col: clean["ending balance"] = final_data[bal_col]
-
     act_col = next((c for c in final_data.columns if "current activity" in c or c == "activity"), None)
     if act_col: clean["current activity"] = final_data[act_col]
 
-    # LLM Mapping
-    llm_targets = ["account", "account description", "beginning balance", "ending balance"]
-    for col in final_data.columns:
-        if "empty_gap" in col or col in clean.columns: continue
-        res = ask_llm(client, deployment, col, final_data[col].dropna().head(3).tolist(), report_year)
-        if res.get('mapped_to') in llm_targets and res.get('confidence', 0) > 0.6:
-            if res['mapped_to'] not in clean: clean[res['mapped_to']] = final_data[col]
+    # 3. Batch LLM Call for remaining columns (Only one call here)
+    unmapped = [c for c in final_data.columns if c not in clean.columns and "empty_gap" not in c]
+    if unmapped:
+        header_samples = {c: final_data[c].dropna().head(3).tolist() for c in unmapped}
+        mappings = ask_llm_batch(client, deployment, header_samples, report_year)
+        for raw_col, target_cat in mappings.items():
+            if target_cat in ["account", "account description", "beginning balance", "ending balance"] and target_cat not in clean:
+                clean[target_cat] = final_data[raw_col]
 
-    clean["property name"] = prop_name
-    clean["property code"] = prop_code
-    clean["period ending"] = report_date.strftime("%Y-%m-%d") if report_date else None
+    # 4. Final Metadata
+    p_name, p_code = match_property_tiered(df, master_df)
+    clean["property name"], clean["property code"] = p_name, p_code
+    clean["period ending"] = report_date.strftime("%Y-%m-%d") if report_date else ""
     
     for c in FINAL_COLUMNS:
-        if c not in clean: clean[c] = None
+        if c not in clean: clean[c] = ""
     
-    return clean[FINAL_COLUMNS]
+    return clean[FINAL_COLUMNS].replace("nan", "").replace(np.nan, "")
 
 def run_pipeline(input_folder):
     logger = setup_logging(input_folder)
     load_dotenv()
-    output_folder = "outputs"
-    if not os.path.exists(output_folder): os.makedirs(output_folder)
-
-    # Updated API Keys per request
-    client = AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"), 
-        azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"), 
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION")
-    )
+    if not os.path.exists("outputs"): os.makedirs("outputs")
+    client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), 
+                         azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"), 
+                         api_version=os.getenv("AZURE_OPENAI_API_VERSION"))
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-    
     master_df = pd.read_excel(PROPERTY_MASTER_PATH) if os.path.exists(PROPERTY_MASTER_PATH) else pd.DataFrame()
     
     for f in os.listdir(input_folder):
@@ -238,13 +233,10 @@ def run_pipeline(input_folder):
             xl = pd.ExcelFile(path, engine=validate_excel_file(path))
             for sheet in xl.sheet_names:
                 if sheet.lower().strip() in IGNORE_SHEET_NAMES: continue
-                df = xl.parse(sheet, header=None).astype(str)
-                res = process_sheet(df, f, sheet, master_df, client, deployment, logger)
+                res = process_sheet(xl.parse(sheet, header=None).astype(str), f, sheet, master_df, client, deployment, logger)
                 if res is not None: file_results.append(res)
-            
             if file_results:
-                out_path = os.path.join(output_folder, f"{os.path.splitext(f)[0]}_new.xlsx")
-                pd.concat(file_results, ignore_index=True).to_excel(out_path, index=False)
+                pd.concat(file_results, ignore_index=True).to_excel(f"outputs/{os.path.splitext(f)[0]}_new.xlsx", index=False)
                 logger.info(f"SUCCESS: {f}")
         except Exception as e: logger.error(f"FAILED {f}: {e}")
 
