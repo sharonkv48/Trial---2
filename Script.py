@@ -26,8 +26,10 @@ TOTAL_REGEX = re.compile(r"^\s*total[:.;'\s-]*.*", re.IGNORECASE)
 
 PROPERTY_MASTER_PATH = "reference/property_master.xlsx"
 
-# Priority 1: N (13) and O (14) | Priority 2: B (1) and F (5)
-PRIORITY_GROUPS = [[13, 14], [1, 5]]
+# Property Master Header Names
+PM_ENTITY_ID = "Entity ID"
+PM_PRIORITY_1 = ["RF Raw ID", "RF Raw Entity Name"] # Formerly N and O
+PM_PRIORITY_2 = ["QIU Name", "EntityName"]         # Formerly B and F
 
 # =========================================================
 # FEW-SHOT SYSTEM PROMPT
@@ -113,16 +115,29 @@ def ask_llm(client, deployment, col_name, sample, report_year):
     except: return {"mapped_to": "other", "confidence": 0}
 
 def match_property_tiered(df, master_df):
+    """Tiered lookup using named columns from Property Master."""
     sample_cells = [normalize(c) for c in df.head(15).astype(str).values.flatten()]
-    for group in PRIORITY_GROUPS:
+    
+    # Priority groups using exact header names provided
+    priority_groups = [PM_PRIORITY_1, PM_PRIORITY_2]
+    
+    for group in priority_groups:
         for _, row in master_df.iterrows():
-            p_code, p_name_master = row.iloc[0], normalize(row.iloc[1])
-            for idx in group:
-                val = normalize(row.iloc[idx])
-                if not val or val == "nan": continue
+            # Get the Entity ID and Entity Name from the row
+            # We assume Entity ID is in a column named 'Entity ID'
+            # and 'EntityName' (or Column B) is the primary property name
+            prop_id = row.get(PM_ENTITY_ID, None)
+            prop_display_name = row.get("EntityName", "Unknown") 
+            
+            for col_name in group:
+                val = normalize(row.get(col_name, ""))
+                if not val or val == "nan": 
+                    continue
+                
                 pattern = re.compile(rf"^\s*{re.escape(val)}\s*$", re.IGNORECASE)
                 if any(pattern.fullmatch(cell) for cell in sample_cells):
-                    return p_name_master, p_code
+                    return prop_display_name, prop_id
+                    
     return None, None
 
 # =========================================================
@@ -165,7 +180,6 @@ def process_sheet(df, file_name, sheet_name, master_df, client, deployment, logg
     headers = []
     for c in range(df.shape[1]):
         parts = [normalize(df.iloc[r, c]) for r in header_rows if normalize(df.iloc[r, c]) not in ["nan", ""]]
-        # Handling gaps: if a column is empty across all header rows, label it 'empty_gap'
         headers.append(" ".join(parts) if parts else f"empty_gap_{c}")
 
     data_block = df.iloc[max(header_rows) + 1:].copy()
@@ -180,7 +194,7 @@ def process_sheet(df, file_name, sheet_name, master_df, client, deployment, logg
     prop_name, prop_code = match_property_tiered(df, master_df)
     clean = pd.DataFrame(index=final_data.index)
     
-    # EXACT KEYWORD MATCHES (Collapses gaps because we search by name, not index)
+    # EXACT KEYWORD MATCHES (Mandatory metadata)
     exact_targets = ["reporting book", "account tree", "location", "database", "report id", "period starting", "debit", "credit"]
     for target in exact_targets:
         col = next((c for c in final_data.columns if normalize(c) == target), None)
@@ -192,7 +206,6 @@ def process_sheet(df, file_name, sheet_name, master_df, client, deployment, logg
     # LLM MAPPING
     llm_targets = ["account", "account description", "beginning balance", "ending balance"]
     for col in final_data.columns:
-        # Skip gaps and already mapped columns
         if "empty_gap" in col or col in clean.columns: continue
         
         sample = final_data[col].dropna().head(3).tolist()
@@ -227,7 +240,12 @@ def run_pipeline(input_folder):
         api_version="2023-05-15"
     )
     deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-    master_df = pd.read_excel(PROPERTY_MASTER_PATH) if os.path.exists(PROPERTY_MASTER_PATH) else pd.DataFrame()
+    
+    if os.path.exists(PROPERTY_MASTER_PATH):
+        master_df = pd.read_excel(PROPERTY_MASTER_PATH)
+    else:
+        logger.error(f"Property master not found at {PROPERTY_MASTER_PATH}")
+        master_df = pd.DataFrame()
     
     for f in os.listdir(input_folder):
         path = os.path.join(input_folder, f)
@@ -247,7 +265,7 @@ def run_pipeline(input_folder):
                 base_name = os.path.splitext(f)[0]
                 output_path = os.path.join(output_folder, f"{base_name}_new.xlsx")
                 pd.concat(file_results, ignore_index=True).to_excel(output_path, index=False)
-                logger.info(f"SAVED: {output_path}")
+                logger.info(f"SUCCESS: {f} -> {output_path}")
         except Exception as e: 
             logger.error(f"FAILED {f}: {e}")
 
