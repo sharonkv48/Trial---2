@@ -1,289 +1,64 @@
 import os
-import json
-import logging
-import re
-import pandas as pd
-import numpy as np
-from dotenv import load_dotenv
-from dateutil import parser
-from openai import AzureOpenAI
+import shutil
+import random
 
-# =========================================================
-# CONFIG & SCHEMA
-# =========================================================
-
-FINAL_COLUMNS = [
-    "account", "account description", "beginning balance", "credit", 
-    "debit", "ending balance", "property name", "property code", 
-    "period starting", "period ending", "reporting book", 
-    "account tree", "location", "database", "report id", "current activity"
-]
-
-IGNORE_SHEET_NAMES = {"upload", "mapping", "starwood property tb"}
-IGNORE_KEYWORDS = {"chart of accounts"}
-REQUIRED_HEADER_KEYWORDS = {"account", "balance", "debit", "credit", "activity"}
-MAX_HEADER_ROWS = 3
-TOTAL_REGEX = re.compile(r"^\s*total[:.;'\s-]*.*", re.IGNORECASE)
-
-PROPERTY_MASTER_PATH = "reference/property_master.xlsx"
-PROPERTY_SHEET_NAME = "AllProperties"
-
-# Priority 1: RF Raw ID/Entity Name | Priority 2: QIU Name/EntityName
-PM_PRIORITY_1 = ["RF Raw ID", "RF Raw Entity Name"] 
-PM_PRIORITY_2 = ["QIU Name", "EntityName"]
-
-# =========================================================
-# SYSTEM PROMPT (FEW-SHOT & OVERRIDE LOGIC)
-# =========================================================
-
-SYSTEM_PROMPT = """You are a financial data mapper. Return STRICT JSON.
-Task: Map raw headers to: [account, account description, beginning balance, ending balance]
-
-FEW-SHOT EXAMPLES:
-- Data: ["Checking Operating 1", "Professional Fees"] -> Map to "account description"
-- Data: ["1110-000", "1261-000"] -> Map to "account"
-- Data: ["Forwarding Balance", "Opening"] -> Map to "beginning balance"
-- Data: ["Closing", "Ending Balance"] -> Map to "ending balance"
-
-RULES:
-1. OVERRIDE: If the data contains text descriptions, map it to 'account description' even if the header is 'Forward' or 'Unnamed'.
-2. Return JSON: {"Raw Header Name": "category"}"""
-
-# =========================================================
-# TRACKING & LOGGING
-# =========================================================
-
-stats = {
-    "total_files": 0, "files_processed": 0, "files_skipped": [],
-    "total_sheets": 0, "sheets_processed": 0, "sheets_skipped": [],
-    "corrupted_files": 0
-}
-
-def setup_logging(input_folder):
-    if not os.path.exists("logs"): os.makedirs("logs")
-    folder_name = os.path.basename(input_folder.strip('/\\'))
-    log_file = f"logs/{folder_name}.txt"
-    for h in logging.root.handlers[:]: logging.root.removeHandler(h)
-    logging.basicConfig(level=logging.INFO, format="%(message)s",
-                        handlers=[logging.FileHandler(log_file), logging.StreamHandler()])
-    return logging.getLogger("ingestion")
-
-# =========================================================
-# HELPERS
-# =========================================================
-
-def normalize_strict(text):
-    if pd.isna(text) or str(text).lower() == "nan": return ""
-    clean = re.sub(r'\(.*?\)|\[.*?\]', '', str(text))
-    clean = re.sub(r'[^a-zA-Z0-9]', '', clean)
-    return clean.lower().strip()
-
-def extract_date_flexible(text):
-    try:
-        match = re.search(r"(\d{2})[/_-](\d{2,4})", text)
-        if match:
-            m, y = match.groups()
-            y = f"20{y}" if len(y) == 2 else y
-            return parser.parse(f"{y}-{m}-01")
-        return parser.parse(text, fuzzy=True)
-    except: return None
-
-def extract_date_from_filename(filename):
-    pats = [r"(\d{4})(\d{2})", r"(\d{2})_(\d{2})_(\d{2})", r"(\d{2})_(\d{2})"]
-    for p in pats:
-        match = re.search(p, filename)
-        if match:
-            try:
-                g = match.groups()
-                if len(g) == 2:
-                    return parser.parse(f"{g[0]}-{g[1]}-01") if len(g[0]) == 4 else parser.parse(f"20{g[1]}-{g[0]}-01")
-                return parser.parse(f"20{g[2]}-{g[0]}-{g[1]}")
-            except: continue
-    return None
-
-def make_unique_headers(headers):
-    seen, unique = {}, []
-    for h in headers:
-        c = str(h).strip().lower()
-        if c not in seen:
-            seen[c] = 0; unique.append(c)
-        else:
-            seen[c] += 1; unique.append(f"{c}_{seen[c]}")
-    return unique
-
-# =========================================================
-# CORE LOGIC
-# =========================================================
-
-def match_property_tiered(df, master_df):
-    """Matches text in top 20 rows against AllProperties sheet."""
-    top_rows = df.head(20).astype(str).values.flatten()
-    clean_sheet = [normalize_strict(cell) for cell in top_rows if normalize_strict(cell) != ""]
+def prepare_balanced_dataset(base_path, output_path):
+    # Mapping your folder names
+    folders = {
+        'bank': 'Input_bank_documents',
+        'invoice': 'Input_invoice_documents',
+        'loan': 'Input_loan_documents'
+    }
     
-    for group in [PM_PRIORITY_1, PM_PRIORITY_2]:
-        for _, row in master_df.iterrows():
-            # Entity ID is strictly in Column E (Index 4)
-            p_id = row.iloc[4] if len(row) > 4 else ""
-            p_name = row.get("EntityName", "")
-            
-            for col in group:
-                kw = normalize_strict(row.get(col, ""))
-                if kw and any(kw == c for c in clean_sheet):
-                    return str(p_name), str(p_id)
-    return "", ""
+    # 1. Create Output Structure
+    for split in ['train', 'test']:
+        for cat in folders.keys():
+            os.makedirs(os.path.join(output_path, split, cat), exist_ok=True)
 
-def ask_llm_batch(client, deployment, headers_with_samples, report_year):
-    msg = f"Report Year: {report_year}\nHeaders:\n{json.dumps(headers_with_samples)}"
-    try:
-        r = client.chat.completions.create(
-            model=deployment,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": msg}],
-            temperature=0, response_format={"type": "json_object"}
-        )
-        return json.loads(r.choices[0].message.content)
-    except: return {}
+    # 2. Split and Move
+    for cat, folder_name in folders.items():
+        src_path = os.path.join(base_path, folder_name)
+        files = [f for f in os.listdir(src_path) if os.path.isfile(os.path.join(src_path, f))]
+        random.shuffle(files)
+        
+        # Calculate 60% for training
+        split_idx = int(len(files) * 0.6)
+        train_files = files[:split_idx]
+        test_files = files[split_idx:]
+        
+        # Copy originals to train/test
+        for f in train_files:
+            shutil.copy(os.path.join(src_path, f), os.path.join(output_path, 'train', cat, f))
+        for f in test_files:
+            shutil.copy(os.path.join(src_path, f), os.path.join(output_path, 'test', cat, f))
 
-def process_sheet(df, file_name, sheet_name, master_df, client, deployment, logger):
-    stats["total_sheets"] += 1
+    # 3. Balancing (Duplication)
+    # We find the category with the most training files (Loan has 16)
+    train_root = os.path.join(output_path, 'train')
+    cat_counts = {cat: len(os.listdir(os.path.join(train_root, cat))) for cat in folders.keys()}
+    target_count = max(cat_counts.values())
     
-    # 1. Ignore Keyword Check
-    if any(k in " ".join(df.head(10).astype(str).values.flatten()).lower() for k in IGNORE_KEYWORDS):
-        stats["sheets_skipped"].append({"file": file_name, "sheet": sheet_name, "reason": "COA keyword"})
-        return None
+    print(f"Targeting {target_count} files per category for training...")
 
-    # 2. Date Detection
-    report_date = None
-    for i in range(min(20, len(df))):
-        line = " ".join(df.iloc[i].astype(str))
-        if any(c.isdigit() for c in line):
-            report_date = extract_date_flexible(line)
-            if report_date: break
-    if not report_date: report_date = extract_date_from_filename(file_name)
-    report_year = report_date.year if report_date else "Unknown"
+    for cat in folders.keys():
+        cat_train_path = os.path.join(train_root, cat)
+        current_files = os.listdir(cat_train_path)
+        current_count = len(current_files)
+        
+        if current_count < target_count:
+            needed = target_count - current_count
+            print(f"Adding {needed} duplicates to {cat}")
+            for i in range(needed):
+                file_to_copy = current_files[i % current_count]
+                name, ext = os.path.splitext(file_to_copy)
+                shutil.copy(
+                    os.path.join(cat_train_path, file_to_copy),
+                    os.path.join(cat_train_path, f"{name}_bal_{i}{ext}")
+                )
 
-    # 3. Header Detection
-    h_start = None
-    for i, row in df.iterrows():
-        if sum(k in " ".join(row.astype(str)).lower() for k in REQUIRED_HEADER_KEYWORDS) >= 2:
-            h_start = i; break
-    if h_start is None: return None
+    print("\nProcess Complete!")
+    print(f"Train set: {target_count * 3} files (Balanced)")
+    print(f"Test set: {50 - sum(cat_counts.values())} files")
 
-    # 4. Merge Headers
-    h_rows = [h_start]
-    for i in range(h_start + 1, min(h_start + MAX_HEADER_ROWS, len(df))):
-        if pd.to_numeric(df.iloc[i], errors="coerce").notna().mean() < 0.3: h_rows.append(i)
-        else: break
-    
-    raw_h = [(" ".join([str(df.iloc[r, c]).strip().lower() for r in h_rows if str(df.iloc[r, c]).strip().lower() not in ["nan", ""]]) 
-              if any(str(df.iloc[r, c]).strip().lower() not in ["nan", ""] for r in h_rows) else f"empty_gap_{c}") 
-             for c in range(df.shape[1])]
-    
-    headers = make_unique_headers(raw_h)
-    data_block = df.iloc[max(h_rows) + 1:].copy()
-    data_block.columns = headers
-    
-    rows = []
-    for _, row in data_block.iterrows():
-        if any(TOTAL_REGEX.match(str(s)) for s in row): break
-        rows.append(row)
-    if not rows: return None
-    final_data = pd.DataFrame(rows)
-
-    # 5. Mapping
-    clean = pd.DataFrame(index=final_data.index)
-    
-    # Exact Keyword Mappings
-    for t in ["reporting book", "account tree", "location", "database", "report id", "period starting", "debit", "credit"]:
-        col = next((c for c in final_data.columns if t in c), None)
-        if col: clean[t] = final_data[col]
-
-    bal_col = next((c for c in final_data.columns if "ending balance" in c or "closing balance" in c), None)
-    if bal_col: clean["ending balance"] = final_data[bal_col]
-    
-    act_col = next((c for c in final_data.columns if "current activity" in c or "activity" in c), None)
-    if act_col: clean["current activity"] = final_data[act_col]
-
-    # Batch LLM Call (Override Logic)
-    unmapped = [c for c in final_data.columns if c not in clean.columns and "empty_gap" not in c]
-    if unmapped:
-        mappings = ask_llm_batch(client, deployment, {c: final_data[c].dropna().head(3).tolist() for c in unmapped}, report_year)
-        df_cols_norm = {str(c).strip().lower(): c for c in final_data.columns}
-        for raw_llm, target in mappings.items():
-            norm = str(raw_llm).strip().lower()
-            if norm in df_cols_norm:
-                actual = df_cols_norm[norm]
-                if target in ["account", "account description", "beginning balance", "ending balance"] and target not in clean:
-                    clean[target] = final_data[actual]
-
-    p_name, p_code = match_property_tiered(df, master_df)
-    clean["property name"], clean["property code"] = p_name, p_code
-    clean["period ending"] = report_date.strftime("%Y-%m-%d") if report_date else ""
-    
-    for c in FINAL_COLUMNS:
-        if c not in clean: clean[c] = ""
-    
-    stats["sheets_processed"] += 1
-    return clean[FINAL_COLUMNS].replace("nan", "").replace(np.nan, "")
-
-# =========================================================
-# RUNNER
-# =========================================================
-
-def run_pipeline(input_folder):
-    logger = setup_logging(input_folder)
-    load_dotenv()
-    if not os.path.exists("outputs"): os.makedirs("outputs")
-    
-    client = AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"), 
-        azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"), 
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION")
-    )
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-    
-    # 1. Load and Normalize Master_DF Columns
-    try:
-        master_df = pd.read_excel(PROPERTY_MASTER_PATH, sheet_name=PROPERTY_SHEET_NAME)
-        # NORMALIZATION STEP: Strip spaces and fix case for lookup headers
-        master_df.columns = [str(c).strip() for c in master_df.columns]
-        logger.info(f"Loaded {PROPERTY_SHEET_NAME}. Columns normalized: {list(master_df.columns)}")
-    except Exception as e:
-        logger.error(f"Could not load AllProperties sheet: {e}")
-        master_df = pd.DataFrame()
-    
-    files = [f for f in os.listdir(input_folder) if f.lower().endswith((".xls", ".xlsx"))]
-    stats["total_files"] = len(files)
-
-    for f in files:
-        path = os.path.join(input_folder, f)
-        try:
-            xl = pd.ExcelFile(path, engine=("openpyxl" if f.endswith(".xlsx") else "xlrd"))
-            output_path = f"outputs/{os.path.splitext(f)[0]}_new.xlsx"
-            valid_found = False
-            
-            with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-                for sheet in xl.sheet_names:
-                    if sheet.lower().strip() in IGNORE_SHEET_NAMES: continue
-                    res = process_sheet(xl.parse(sheet, header=None).astype(str), f, sheet, master_df, client, deployment, logger)
-                    if res is not None:
-                        res.to_excel(writer, sheet_name=sheet[:31], index=False)
-                        valid_found = True
-            
-            if valid_found: stats["files_processed"] += 1
-            else: 
-                if os.path.exists(output_path): os.remove(output_path)
-                stats["files_skipped"].append({"file": f, "reason": "No valid data extracted"})
-
-        except Exception as e:
-            stats["corrupted_files"] += 1
-            stats["files_skipped"].append({"file": f, "reason": f"Corrupt or read error: {str(e)}"})
-
-    # Final Audit Summary
-    logger.info("\n" + "="*30 + " SUMMARY " + "="*30)
-    logger.info(f"Files Processed: {stats['files_processed']}/{stats['total_files']} | Corrupt: {stats['corrupted_files']}")
-    logger.info(f"Sheets Processed: {stats['sheets_processed']} | Attempted: {stats['total_sheets']}")
-    for fs in stats["files_skipped"]: logger.info(f"Skipped File: {fs['file']} ({fs['reason']})")
-    logger.info("="*69)
-
-if __name__ == "__main__":
-    run_pipeline("input/")
+# Execution
+prepare_balanced_dataset('input_documents', 'azure_training_ready')
